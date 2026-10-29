@@ -4,6 +4,10 @@
 #   3) area managers not called in the last 3 days (yesterday + 2 days before).
 # PDF attached to the email, the three tables in the email body.
 # If there were no calls yesterday, the email says: لا يوجد اتصالات خلال امس
+#
+# Template versions handled (answers are read by title, so field order does not matter):
+#   v1 (until 2026-10-28): "اسم مدير المنطقة الذي متواجد بالفرع"   -> list of managers AT the branch
+#   v2 (from 2026-10-28):  "اسم مدير المنطقة الغير متواجد بالفرع" -> list of managers NOT at the branch
 
 import os, ast, html, asyncio, smtplib, requests, pytz
 from datetime import datetime, timedelta
@@ -28,11 +32,12 @@ TZ              = pytz.timezone("Asia/Riyadh")
 NOT_CALLED_DAYS = 3
 OUT_HTML        = "quick_call_report.html"
 
-Q_CALLED  = "اسم مدير المنطقة"
-Q_PRESENT = "اسم مدير المنطقة الذي متواجد بالفرع"
-Q_ABSENT  = "اسم مدير المنطقة الذي لم يحضر"
-Q_ATTEND  = "هل تم الحضور من قبل المحددة اسمائهم؟"
-Q_ALLIN   = "هل جميعهم متواجدين بالفروع؟"
+Q_CALLED      = "اسم مدير المنطقة"
+Q_PRESENT     = "اسم مدير المنطقة الذي متواجد بالفرع"      # v1 (old)
+Q_NOT_PRESENT = "اسم مدير المنطقة الغير متواجد بالفرع"     # v2 (new)
+Q_ABSENT      = "اسم مدير المنطقة الذي لم يحضر"
+Q_ATTEND      = "هل تم الحضور من قبل المحددة اسمائهم؟"
+Q_ALLIN       = "هل جميعهم متواجدين بالفروع؟"
 
 # Active roster: Arabic form name -> English roster name
 ROSTER = {
@@ -53,9 +58,10 @@ ROSTER = {
 # Names in the form that are not area managers — ignored everywhere
 EXCLUDED = {"محمد غزالي", "سعد الشريف", "علام محمود", "محمد الحويدر", "اصيل عبدالله", "محمد مختار"}
 
-PRESENT = "متواجد بالفرع"
-ABSENT  = "لم يحضر"
-UNKNOWN = "غير محدد"
+PRESENT     = "متواجد بالفرع"
+NOT_PRESENT = "غير متواجد بالفرع"
+ABSENT      = "لم يحضر"
+UNKNOWN     = "غير محدد"
 NO_CALLS_MSG = "لا يوجد اتصالات خلال امس"
 
 
@@ -112,6 +118,8 @@ while True:
     dts = [d for d in dts if d]
     if dts and min(dts).date() < fetch_floor:
         break
+    if len(batch) < 100:
+        break
     start += 100
 print(f"Fetched {len(subs)} submissions")
 
@@ -123,34 +131,47 @@ for s in subs:
     dt = parse_dt(m.get("date_submitted"))
     if not dt or dt.date() > report_date:
         continue
-    ans = {a.get("title"): a.get("value") for a in s.get("answers", [])}
-    called  = as_list(ans.get(Q_CALLED))
-    present = set(as_list(ans.get(Q_PRESENT)))
-    absent  = set(as_list(ans.get(Q_ABSENT)))
-    attend  = as_bool(ans.get(Q_ATTEND))
-    allin   = as_bool(ans.get(Q_ALLIN))
-    caller  = (m.get("created_by") or {}).get("display_name", "")
+    ans = {(a.get("title") or "").strip(): a.get("value") for a in s.get("answers", [])}
+    is_v2       = Q_NOT_PRESENT in ans
+    called      = as_list(ans.get(Q_CALLED))
+    present     = set(as_list(ans.get(Q_PRESENT)))
+    not_present = set(as_list(ans.get(Q_NOT_PRESENT)))
+    absent      = set(as_list(ans.get(Q_ABSENT)))
+    attend      = as_bool(ans.get(Q_ATTEND))
+    allin       = as_bool(ans.get(Q_ALLIN))
+    caller      = (m.get("created_by") or {}).get("display_name", "")
+    ver         = "v2" if is_v2 else "v1"
 
     for name in called:
         if name in EXCLUDED:
             continue
         if name in absent:
             status = ABSENT
+        elif name in not_present:
+            status = NOT_PRESENT
         elif name in present:
-            status = PRESENT
-        elif attend is True and allin is True:
             status = PRESENT
         elif attend is False and not absent:
             status = ABSENT          # flagged "no" but list left empty
+        elif is_v2:
+            status = PRESENT         # v2: attended and not listed as not-at-branch
+        elif attend is True and allin is True:
+            status = PRESENT
         else:
             status = UNKNOWN
-        events.append({"name": name, "dt": dt, "day": dt.date(), "status": status, "caller": caller})
+        events.append({"name": name, "dt": dt, "day": dt.date(), "status": status,
+                       "caller": caller, "ver": ver})
 
     for name in absent - set(called) - EXCLUDED:
-        events.append({"name": name, "dt": dt, "day": dt.date(), "status": ABSENT, "caller": caller})
+        events.append({"name": name, "dt": dt, "day": dt.date(), "status": ABSENT,
+                       "caller": caller, "ver": ver})
+    for name in not_present - absent - set(called) - EXCLUDED:
+        events.append({"name": name, "dt": dt, "day": dt.date(), "status": NOT_PRESENT,
+                       "caller": caller, "ver": ver})
 
 day_ev = [e for e in events if e["day"] == report_date]
-print(f"Events total {len(events)} | on report day {len(day_ev)}")
+print(f"Events total {len(events)} | on report day {len(day_ev)} "
+      f"(v1 {sum(e['ver'] == 'v1' for e in day_ev)}, v2 {sum(e['ver'] == 'v2' for e in day_ev)})")
 
 
 # ---------------- tables ----------------
@@ -184,9 +205,11 @@ for name, en in ROSTER.items():
     not_called_rows.append({"name": name, "en": en, "last": lc,
                             "days": (report_date - lc.date()).days if lc else None})
 not_called_rows.sort(key=lambda r: (r["days"] is not None, -(r["days"] or 0)))
-present_cnt = sum(1 for r in called_rows if r["status"] == PRESENT)
+present_cnt     = sum(1 for r in called_rows if r["status"] == PRESENT)
+not_present_cnt = sum(1 for r in called_rows if r["status"] == NOT_PRESENT)
 
-print(f"Called {len(called_rows)} | present {present_cnt} | not attended {len(absent_rows)} | not called {NOT_CALLED_DAYS}d {len(not_called_rows)}")
+print(f"Called {len(called_rows)} | present {present_cnt} | not at branch {not_present_cnt} | "
+      f"not attended {len(absent_rows)} | not called {NOT_CALLED_DAYS}d {len(not_called_rows)}")
 for r in called_rows:
     print(f"  {r['name']} ({r['en']}) | {r['calls']} call(s) | last {r['last']:%H:%M} | {r['status']}")
 
@@ -195,9 +218,10 @@ for r in called_rows:
 TH = "background:#1e293b;color:#ffffff;padding:8px;text-align:right;font-weight:600;font-size:14px;"
 TD = "padding:8px;border-bottom:1px solid #e5e9ef;text-align:right;font-size:14px;"
 BADGE = {
-    PRESENT: "background:#dcfce7;color:#166534;",
-    ABSENT:  "background:#fee2e2;color:#991b1b;",
-    UNKNOWN: "background:#e5e7eb;color:#374151;",
+    PRESENT:     "background:#dcfce7;color:#166534;",
+    NOT_PRESENT: "background:#ffedd5;color:#9a3412;",
+    ABSENT:      "background:#fee2e2;color:#991b1b;",
+    UNKNOWN:     "background:#e5e7eb;color:#374151;",
 }
 
 def badge(status):
@@ -224,7 +248,7 @@ t_absent = table(
     ["#", "مدير المنطقة", "Area Manager", "وقت الاتصال", "المتصل"],
     [[i + 1, esc(r["name"]), esc(r["en"]), r["last"].strftime("%H:%M"), esc(r["caller"])]
      for i, r in enumerate(absent_rows)],
-    "جميع من تم الاتصال بهم متواجدون")
+    "جميع من تم الاتصال بهم حضروا")
 t_not_called = table(
     ["#", "مدير المنطقة", "Area Manager", "آخر اتصال", "منذ (يوم)"],
     [[i + 1, esc(r["name"]), esc(r["en"]),
@@ -250,6 +274,7 @@ cards = (
     card(len(ROSTER), "إجمالي مدراء المناطق", "#1d4ed8")
     + card(len(called_rows), "تم الاتصال بهم", "#1d4ed8")
     + card(present_cnt, "متواجدون بالفرع", "#15803d")
+    + card(not_present_cnt, "غير متواجدين بالفرع", "#ea580c")
     + card(len(absent_rows), "لم يحضروا", "#b91c1c")
     + card(len(not_called_rows), f"لم يتم الاتصال بهم آخر {NOT_CALLED_DAYS} أيام", "#c2410c")
 )
@@ -259,7 +284,7 @@ page = f"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap" rel="stylesheet">
 <style>body{{font-family:Cairo,Tahoma,sans-serif;background:#f4f6f9;color:#1f2933;margin:0;padding:24px}}
 .wrap{{max-width:1100px;margin:auto}}
-.cards{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:22px}}</style>
+.cards{{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:22px}}</style>
 </head><body><div class="wrap">
 <h1 style="margin:0;font-size:24px;">{TITLE}</h1>
 <div style="color:#6b7785;margin:4px 0 20px;">Quick Call Report — {report_date:%Y-%m-%d} | تاريخ الإصدار {now:%Y-%m-%d %H:%M}</div>
@@ -337,7 +362,8 @@ else:
     print(f"PDF saved: {pdf_file}")
     summary = (f'<div style="margin-bottom:16px;font-size:14px;">'
                f'تم الاتصال بـ <b>{len(called_rows)}</b> من مدراء المناطق، '
-               f'المتواجدون بالفرع <b>{present_cnt}</b>، لم يحضروا <b>{len(absent_rows)}</b>، '
+               f'المتواجدون بالفرع <b>{present_cnt}</b>، غير المتواجدين بالفرع <b>{not_present_cnt}</b>، '
+               f'لم يحضروا <b>{len(absent_rows)}</b>، '
                f'ولم يتم الاتصال بـ <b>{len(not_called_rows)}</b> خلال آخر {NOT_CALLED_DAYS} أيام. '
                f'التقرير الكامل مرفق بصيغة PDF.</div>')
     body = email_wrap(
